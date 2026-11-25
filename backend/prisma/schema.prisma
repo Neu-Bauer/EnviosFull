@@ -1,0 +1,144 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Tenant {
+  id        Int      @id @default(autoincrement())
+  nome      String
+  slug      String   @unique
+  status    String   @default("ATIVO")
+  modulos   String[] @default([])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  mascarasSenhaHash String?
+
+  cargos      Cargo[]
+  usuarios    Usuario[]
+  motoristas  Motorista[]
+  veiculos    Veiculo[]
+  inbounds    InboundFull[]
+  inboundSkus InboundSku[]
+  mascarasSku MascaraSku[]
+}
+
+model Cargo {
+  id         Int       @id @default(autoincrement())
+  nome       String
+  permissoes Json
+  usuarios   Usuario[]
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  tenantId Int
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, nome])
+}
+
+model Usuario {
+  id                Int     @id @default(autoincrement())
+  username          String  @unique
+  senha             String
+  precisaMudarSenha Boolean @default(true)
+  sessaoToken       String?
+  isSuperAdmin      Boolean @default(false)
+
+  cargoId Int?
+  cargo   Cargo? @relation(fields: [cargoId], references: [id], onDelete: SetNull)
+
+  tenantId Int?
+  tenant   Tenant? @relation(fields: [tenantId], references: [id])
+
+  createdAt DateTime      @default(now())
+  inbounds  InboundFull[]
+}
+
+model Motorista {
+  id        Int           @id @default(autoincrement())
+  nome      String
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  inbounds  InboundFull[]
+
+  tenantId Int
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+}
+
+model Veiculo {
+  id        Int           @id @default(autoincrement())
+  modelo    String
+  placa     String
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+  inbounds  InboundFull[]
+
+  tenantId Int
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, placa])
+}
+
+model InboundFull {
+  id          Int     @id @default(autoincrement())
+  numeroFrete String?
+  nomePallet  String
+  status      String  @default("PENDENTE")
+
+  usuarioId Int?
+  usuario   Usuario? @relation(fields: [usuarioId], references: [id])
+
+  motoristaId Int?
+  motorista   Motorista? @relation(fields: [motoristaId], references: [id])
+
+  veiculoId Int?
+  veiculo   Veiculo? @relation(fields: [veiculoId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  skus InboundSku[]
+
+  tenantId Int
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+}
+
+model InboundSku {
+  id               Int         @id @default(autoincrement())
+  inboundId        Int
+  inbound          InboundFull @relation(fields: [inboundId], references: [id], onDelete: Cascade)
+  sku              String
+  descricao        String
+  quantidadeTotal  Int
+  quantidadeBipada Int         @default(0)
+  status           String      @default("PENDENTE")
+  variacoes        Json?
+
+  leituras Json?
+
+  bloqueado Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenantId Int
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+}
+
+model MascaraSku {
+  id        Int      @id @default(autoincrement())
+  sku       String
+  mascara   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenantId Int
+  tenant   Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, sku])
+}

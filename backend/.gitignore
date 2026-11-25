@@ -1,0 +1,7 @@
+*.db
+*.db-journal
+.env
+node_modules/
+dist/
+
+/generated/prisma

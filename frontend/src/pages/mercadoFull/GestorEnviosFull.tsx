@@ -1,0 +1,1378 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useToast } from '../../contexts/toastContext';
+import { socket } from '../../services/socketClient'; 
+
+interface Variacao { codigoML: string; codigoUniversal: string; quantidade: number; }
+interface Leitura { id: string; codigo: string; tipo: 'SKU_EAN' | 'SERIE'; data: string; usuarioNome: string; }
+interface InboundSKU {
+  id: number; sku: string; descricao: string; quantidadeTotal: number;
+  quantidadeBipada: number; status: 'PENDENTE' | 'EM_PROCESSO' | 'CONCLUIDO';
+  variacoes?: Variacao[]; leituras?: Leitura[];
+  mascaraPredefinida?: string | null; 
+  bloqueado?: boolean; 
+  updatedAt?: string;
+}
+
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
+
+
+
+const lockKey = (id: number | string) => `full:${id}`;
+const POR_PAGINA = 6;
+
+
+function Paginador({ pagina, totalPaginas, onChange }: { pagina: number; totalPaginas: number; onChange: (p: number) => void }) {
+  if (totalPaginas <= 1) return null;
+  const btn = 'h-9 min-w-9 px-2 rounded-lg border text-sm font-bold transition-colors disabled:opacity-40 disabled:cursor-not-allowed';
+  const paginas = Array.from({ length: totalPaginas }, (_, i) => i + 1);
+  return (
+    <div className="flex items-center justify-center gap-1.5 mt-6 flex-wrap">
+      <button className={`${btn} border-[var(--border-color)] bg-[var(--bg-panel)] text-[var(--text-main)] hover:border-blue-500`} disabled={pagina <= 1} onClick={() => onChange(pagina - 1)}>‹</button>
+      {totalPaginas <= 7
+        ? paginas.map((p) => (
+            <button key={p} onClick={() => onChange(p)} className={`${btn} ${p === pagina ? 'bg-blue-600 border-blue-600 text-white' : 'border-[var(--border-color)] bg-[var(--bg-panel)] text-[var(--text-main)] hover:border-blue-500'}`}>{p}</button>
+          ))
+        : <span className="px-3 text-sm font-bold text-[var(--text-muted)]">Página {pagina} de {totalPaginas}</span>}
+      <button className={`${btn} border-[var(--border-color)] bg-[var(--bg-panel)] text-[var(--text-main)] hover:border-blue-500`} disabled={pagina >= totalPaginas} onClick={() => onChange(pagina + 1)}>›</button>
+    </div>
+  );
+}
+
+const gerarMascara = (str: string) => {
+  if (!str) return '';
+  const strUp = str.toUpperCase().trim();
+  
+  if (strUp.length <= 3) {
+    return strUp.split('').map(char => {
+      if (/[0-9]/.test(char)) return '#';
+      if (/[A-Z]/.test(char)) return '@';
+      return char;
+    }).join('');
+  }
+
+  const prefixo = strUp.substring(0, 2);
+  const resto = strUp.substring(2);
+  
+  const mascaraResto = resto.split('').map(char => {
+    if (/[0-9]/.test(char)) return '#';
+    if (/[A-Z]/.test(char)) return '@';
+    return char;
+  }).join('');
+
+  return prefixo + mascaraResto;
+};
+
+
+const validarMascara = (codigo: string, mascara: string) => {
+  if (codigo.length !== mascara.length) return false;
+  
+  for (let i = 0; i < mascara.length; i++) {
+    const charCod = codigo[i].toUpperCase();
+    const charMasc = mascara[i].toUpperCase();
+
+    if (charMasc === '#') {
+      if (!/[0-9]/.test(charCod)) return false;
+    } else if (charMasc === '@') {
+      if (!/[A-Z]/.test(charCod)) return false;
+    } else if (charMasc === '*') {
+      if (!/[A-Z0-9]/.test(charCod)) return false; 
+    } else {
+      if (charCod !== charMasc) return false; 
+    }
+  }
+  return true;
+};
+
+const tocarSom = (tipo: 'sucesso' | 'erro' | 'invalido') => {
+  try {
+    let audioPath = '';
+    
+    if (tipo === 'sucesso') audioPath = '/sounds/beep_sucesso.mp3';
+    else if (tipo === 'erro') audioPath = '/sounds/beep_duplicidade.mp3';
+    else if (tipo === 'invalido') audioPath = '/sounds/beep_erro.mp3';
+
+    if (audioPath) {
+      const audio = new Audio(audioPath);
+      audio.volume = 1.0; 
+      audio.play().catch(e => console.log('Áudio bloqueado pelo navegador:', e));
+    }
+  } catch (error) {
+    console.error('Erro ao tocar som:', error);
+  }
+};
+
+export default function GestorEnviosFull() {
+  const navigate = useNavigate();
+  const toast = useToast();
+  const [currentScreen, setCurrentScreen] = useState(1);
+  
+  const [dashboardData, setDashboardData] = useState<{motoristas: any[], veiculos: any[], inbounds: any[]}>({ motoristas: [], veiculos: [], inbounds: [] });
+  
+  const [nomePallet, setNomePallet] = useState('');
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const getUsuarioLogado = () => {
+    const keysToTry = ['wms_user', 'wms_username', 'username', 'usuario', 'nome', 'user', 'user_data', 'auth'];
+    for (const key of keysToTry) {
+      const val = localStorage.getItem(key);
+      if (val && val !== 'undefined' && val !== 'null') {
+        if (val.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(val);
+            const extractedName = parsed.nome || parsed.username || parsed.name || parsed.usuario;
+            if (extractedName) return String(extractedName);
+          } catch (e) {}
+        } else { return val; }
+      }
+    }
+    return 'Operador_X'; 
+  };
+
+  const [inboundData, setInboundData] = useState<any | null>(null);
+  const [skus, setSkus] = useState<InboundSKU[]>([]);
+  const [skuEmBipagem, setSkuEmBipagem] = useState<InboundSKU | null>(null);
+  const [isScanning, setIsScanning] = useState(false);
+  const [codigoLido, setCodigoLido] = useState('');
+  const [modoBipagem, setModoBipagem] = useState<'SKU_EAN' | 'SERIE'>('SKU_EAN');
+  const [mascaraSerie, setMascaraSerie] = useState<string | null>(null);
+  const inputBipagemRef = useRef<HTMLInputElement>(null);
+  
+  const [modoTravado, setModoTravado] = useState(false);
+  const [showSucessoProduto, setShowSucessoProduto] = useState(false);
+  const [tecladoLiberado, setTecladoLiberado] = useState(false);
+  
+  const [modoConfirmModal, setModoConfirmModal] = useState<{isOpen: boolean, novoModo: 'SKU_EAN' | 'SERIE' | null}>({ isOpen: false, novoModo: null });
+  
+  const [showModalFinalizarEnvio] = useState(false);
+  const [motoristaSelecionado, setMotoristaSelecionado] = useState('');
+  const [veiculoSelecionado, setVeiculoSelecionado] = useState('');
+  
+  const [showModalMotorista, setShowModalMotorista] = useState(false);
+  const [nomeMotorista, setNomeMotorista] = useState('');
+  const [showModalVeiculo, setShowModalVeiculo] = useState(false);
+  const [nomeVeiculo, setNomeVeiculo] = useState('');
+  const [placaVeiculo, setPlacaVeiculo] = useState('');
+
+  const [showMotoristasList, setShowMotoristasList] = useState(false);
+  const [showVeiculosList, setShowVeiculosList] = useState(false);
+
+  
+  const [showModalMascaras, setShowModalMascaras] = useState(false);
+  const [mascaraView, setMascaraView] = useState<'senha' | 'definirSenha' | 'lista' | 'trocarSenha'>('senha');
+  const [mascaraToken, setMascaraToken] = useState<string | null>(null);
+  const [mascaraSenhaInput, setMascaraSenhaInput] = useState('');
+  const [mascaraNovaSenha, setMascaraNovaSenha] = useState('');
+  const [mascaraSenhaAtualTroca, setMascaraSenhaAtualTroca] = useState('');
+  const [mascaraNovaSenhaTroca, setMascaraNovaSenhaTroca] = useState('');
+  const [mascarasJson, setMascarasJson] = useState('{\n\n}');
+  const [mascaraCarregando, setMascaraCarregando] = useState(false);
+
+  const [termoBusca, setTermoBusca] = useState('');
+  
+  const dataAtual = new Date();
+  const dataInicioPadrao = new Date(dataAtual.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+  const dataFimPadrao = new Date(dataAtual.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+  
+  const [dataInicio, setDataInicio] = useState(dataInicioPadrao);
+  const [dataFim, setDataFim] = useState(dataFimPadrao);
+
+  const [filtros, setFiltros] = useState({ PENDENTE: true, EM_PROCESSO: true, CONCLUIDO: true, ENVIADO: true });
+  const [pagina, setPagina] = useState(1);
+
+  const [modalCoord, setModalCoord] = useState<{isOpen: boolean, inboundId: number | null, acao: 'EXCLUIR' | 'ENVIAR' | null, nomePallet: string}>({
+    isOpen: false, inboundId: null, acao: null, nomePallet: ''
+  });
+
+  const [lockedSkus, setLockedSkus] = useState<Record<string, string>>({});
+  const skuTravadoRef = useRef<number | null>(null);
+
+  const autoSaveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const onLocksInitial = (data: Record<string, string>) => setLockedSkus(data);
+    const onLockUpdate = ({ skuId, lockedBy }: { skuId: string, lockedBy: string | null }) => {
+      setLockedSkus(prev => { const novo = { ...prev }; if (lockedBy) novo[skuId] = lockedBy; else delete novo[skuId]; return novo; });
+    };
+    const onLockedError = (data: { skuId: string, usuario: string }) => {
+      toast.error(`Atenção! O usuário ${data.usuario} já está conferindo este produto.`);
+      setSkuEmBipagem(null); setIsScanning(false);
+    };
+    const onConnect = () => socket.emit('request_sku_locks');
+
+    socket.on('sku_locks_initial', onLocksInitial);
+    socket.on('sku_lock_update', onLockUpdate);
+    socket.on('sku_locked_error', onLockedError);
+    socket.on('connect', onConnect);
+    socket.emit('request_sku_locks'); 
+
+    return () => {
+      socket.off('sku_locks_initial', onLocksInitial);
+      socket.off('sku_lock_update', onLockUpdate);
+      socket.off('sku_locked_error', onLockedError);
+      socket.off('connect', onConnect);
+      if (skuTravadoRef.current != null) {
+        socket.emit('unlock_sku', { skuId: lockKey(skuTravadoRef.current) });
+        skuTravadoRef.current = null;
+      }
+    };
+    
+  }, []);
+
+  const carregarDashboard = async () => {
+    try {
+      const token = localStorage.getItem('wms_token');
+      const res = await fetch(`${API_URL}/inbounds/dashboard`, { headers: { 'Authorization': `Bearer ${token}` } });
+      if (res.ok) {
+        const data = await res.json();
+        const inbTratados = data.inbounds.map((inb: any) => ({
+          ...inb, skus: inb.skus.map((s: any) => ({ ...s, leituras: typeof s.leituras === 'string' ? JSON.parse(s.leituras) : (s.leituras || []) }))
+        }));
+        setDashboardData({ motoristas: data.motoristas || [], veiculos: data.veiculos || [], inbounds: inbTratados });
+      }
+    } catch (error) { console.error('Erro dashboard', error); }
+  };
+
+  useEffect(() => { carregarDashboard(); }, []);
+
+  useEffect(() => {
+    if (modoTravado && inputBipagemRef.current) setTimeout(() => inputBipagemRef.current?.focus(), 50);
+  }, [modoTravado, showModalFinalizarEnvio, showSucessoProduto, tecladoLiberado]);
+
+  const autoSalvarBackground = (skusAtualizados: InboundSKU[]) => {
+    if (!inboundData) return;
+
+    setDashboardData((prev: any) => ({
+      ...prev,
+      inbounds: prev.inbounds.map((i: any) => i.id === inboundData.id ? { ...i, skus: skusAtualizados } : i)
+    }));
+
+    if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current);
+    
+    autoSaveTimeoutRef.current = setTimeout(async () => {
+      try {
+        const token = localStorage.getItem('wms_token');
+        await fetch(`${API_URL}/inbounds/${inboundData.id}/finalizar`, {
+          method: 'PUT', 
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          body: JSON.stringify({ motoristaId: motoristaSelecionado || null, veiculoId: veiculoSelecionado || null, skus: skusAtualizados })
+        });
+      } catch (err) {
+        console.error("Erro no autosave silencioso", err);
+      }
+    }, 1500);
+  };
+
+  const handleSalvarMotorista = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!nomeMotorista.trim()) return toast.error('Informe o nome do motorista!');
+    try {
+      const token = localStorage.getItem('wms_token');
+      const res = await fetch(`${API_URL}/inbounds/motoristas`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` }, body: JSON.stringify({ nome: nomeMotorista }) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      toast.success(data.mensagem); setNomeMotorista(''); setShowModalMotorista(false); setShowMotoristasList(true); setShowVeiculosList(false); carregarDashboard();
+    } catch (err: any) { toast.error(err.message); }
+  };
+
+  const handleSalvarVeiculo = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!nomeVeiculo.trim() || !placaVeiculo.trim()) return toast.error('Informe o modelo e a placa!');
+    try {
+      const token = localStorage.getItem('wms_token');
+      const res = await fetch(`${API_URL}/inbounds/veiculos`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` }, body: JSON.stringify({ modelo: nomeVeiculo, placa: placaVeiculo }) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      toast.success(data.mensagem); setNomeVeiculo(''); setPlacaVeiculo(''); setShowModalVeiculo(false); setShowVeiculosList(true); setShowMotoristasList(false); carregarDashboard();
+    } catch (err: any) { toast.error(err.message); }
+  };
+
+  const formatarMascarasJson = (lista: { sku: string; mascara: string }[]) => {
+    const objeto: Record<string, string> = {};
+    lista.forEach((item) => { objeto[item.sku] = item.mascara; });
+    return JSON.stringify(objeto, null, 2);
+  };
+
+  const carregarMascarasLista = async (token: string) => {
+    try {
+      const wmsToken = localStorage.getItem('wms_token');
+      const res = await fetch(`${API_URL}/mascaras`, { headers: { 'Authorization': `Bearer ${wmsToken}`, 'x-mascara-token': token } });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      setMascarasJson(formatarMascarasJson(data.mascaras || []));
+    } catch (err: any) { toast.error(err.message); }
+  };
+
+  const handleVerificarSenhaMascara = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!mascaraSenhaInput.trim()) return toast.error('Informe a senha.');
+    setMascaraCarregando(true);
+    try {
+      const wmsToken = localStorage.getItem('wms_token');
+      const res = await fetch(`${API_URL}/mascaras/senha/verificar`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${wmsToken}` }, body: JSON.stringify({ senha: mascaraSenhaInput }) });
+      const data = await res.json();
+      if (!res.ok) {
+        if (data.code === 'SENHA_NAO_DEFINIDA') { setMascaraView('definirSenha'); return; }
+        throw new Error(data.error);
+      }
+      setMascaraToken(data.token); setMascaraSenhaInput(''); setMascaraView('lista');
+      await carregarMascarasLista(data.token);
+    } catch (err: any) { toast.error(err.message); } finally { setMascaraCarregando(false); }
+  };
+
+  const handleDefinirSenhaMascaraInicial = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (mascaraNovaSenha.trim().length < 4) return toast.error('A senha precisa ter pelo menos 4 caracteres.');
+    setMascaraCarregando(true);
+    try {
+      const wmsToken = localStorage.getItem('wms_token');
+      const res = await fetch(`${API_URL}/mascaras/senha`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${wmsToken}` }, body: JSON.stringify({ novaSenha: mascaraNovaSenha }) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      toast.success(data.mensagem);
+      const senhaRecemCriada = mascaraNovaSenha;
+      setMascaraNovaSenha('');
+      
+      const verifyRes = await fetch(`${API_URL}/mascaras/senha/verificar`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${wmsToken}` }, body: JSON.stringify({ senha: senhaRecemCriada }) });
+      const verifyData = await verifyRes.json();
+      if (verifyRes.ok) { setMascaraToken(verifyData.token); setMascaraSenhaInput(''); setMascaraView('lista'); await carregarMascarasLista(verifyData.token); }
+    } catch (err: any) { toast.error(err.message); } finally { setMascaraCarregando(false); }
+  };
+
+  const handleTrocarSenhaMascara = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (mascaraNovaSenhaTroca.trim().length < 4) return toast.error('A nova senha precisa ter pelo menos 4 caracteres.');
+    try {
+      const wmsToken = localStorage.getItem('wms_token');
+      const res = await fetch(`${API_URL}/mascaras/senha`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${wmsToken}` }, body: JSON.stringify({ senhaAtual: mascaraSenhaAtualTroca, novaSenha: mascaraNovaSenhaTroca }) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      toast.success(data.mensagem); setMascaraSenhaAtualTroca(''); setMascaraNovaSenhaTroca(''); setMascaraView('lista');
+    } catch (err: any) { toast.error(err.message); }
+  };
+
+  const handleSincronizarMascaras = async () => {
+    if (!mascaraToken) return toast.error('Sessão de máscaras expirada. Informe a senha novamente.');
+    let objeto: Record<string, unknown>;
+    try {
+      objeto = JSON.parse(mascarasJson);
+      if (typeof objeto !== 'object' || Array.isArray(objeto) || objeto === null) throw new Error();
+    } catch {
+      return toast.error('JSON inválido. Confira as chaves, aspas e vírgulas.');
+    }
+    try {
+      const wmsToken = localStorage.getItem('wms_token');
+      const res = await fetch(`${API_URL}/mascaras/sincronizar`, { method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${wmsToken}`, 'x-mascara-token': mascaraToken }, body: JSON.stringify({ mascaras: objeto }) });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      toast.success(data.mensagem);
+      setMascarasJson(formatarMascarasJson(data.mascaras || []));
+    } catch (err: any) { toast.error(err.message); }
+  };
+
+  const fecharModalMascaras = () => {
+    setShowModalMascaras(false);
+    setMascaraSenhaAtualTroca(''); setMascaraNovaSenhaTroca('');
+    setMascaraView(mascaraToken ? 'lista' : 'senha');
+  };
+
+  const handleAcaoCoordenador = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      const token = localStorage.getItem('wms_token');
+      const res = await fetch(`${API_URL}/inbounds/${modalCoord.inboundId}/coordenador`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` }, body: JSON.stringify({ acao: modalCoord.acao }) });
+      if (modalCoord.acao === 'ENVIAR') {
+        if (!res.ok) throw new Error('Erro ao gerar relatório.');
+        const blob = await res.blob(); const url = window.URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `Relatorio_${modalCoord.nomePallet}.xlsx`; document.body.appendChild(a); a.click(); a.remove(); window.URL.revokeObjectURL(url);
+        toast.success("Envio Despachado e Relatório Baixado!"); setModalCoord({ isOpen: false, inboundId: null, acao: null, nomePallet: '' }); setCurrentScreen(1); carregarDashboard(); return;
+      }
+      const data = await res.json().catch(() => ({})); if (!res.ok) throw new Error(data.error || 'Erro.');
+      toast.success(data.mensagem); setModalCoord({ isOpen: false, inboundId: null, acao: null, nomePallet: '' }); carregarDashboard();
+    } catch (err: any) { toast.error(err.message || 'Erro.'); }
+  };
+
+  const handleReimprimir = async (inb: any) => {
+    try {
+      toast.success("Gerando arquivo...");
+      const token = localStorage.getItem('wms_token');
+      const res = await fetch(`${API_URL}/inbounds/${inb.id}/coordenador`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` }, body: JSON.stringify({ acao: 'REIMPRIMIR' }) });
+      if (!res.ok) throw new Error('Erro.');
+      const blob = await res.blob(); const url = window.URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `Relatorio_${inb.nomePallet}.xlsx`; document.body.appendChild(a); a.click(); a.remove(); window.URL.revokeObjectURL(url);
+    } catch (err: any) { toast.error(err.message); }
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      setSelectedFile(e.target.files[0]);
+      const match = e.target.files[0].name.match(/(Envio-\d+)/i);
+      if (match && match[1]) setNomePallet(`${match[1]} `); 
+    }
+  };
+
+  const handleProcessarNovo = async () => {
+    if (!selectedFile || !nomePallet) return toast.error("Preencha o nome e anexe o arquivo.");
+    setIsProcessing(true);
+    try {
+      const token = localStorage.getItem('wms_token');
+      const formData = new FormData(); 
+      formData.append('nomePallet', nomePallet); 
+      formData.append('inboundPdf', selectedFile);
+      formData.append('usuarioImportador', getUsuarioLogado());
+
+      const res = await fetch(`${API_URL}/inbounds/upload`, { method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, body: formData });
+      const data = await res.json(); if (!res.ok) throw new Error(data.error);
+      toast.success(data.mensagem); setNomePallet(''); setSelectedFile(null); carregarDashboard(); setCurrentScreen(1); 
+    } catch (err: any) { toast.error(err.message); } finally { setIsProcessing(false); }
+  };
+
+  const abrirEnvioCompleto = (inb: any) => {
+    const totalUnidadesCalc = inb.skus.reduce((acc: number, item: any) => acc + (item.bloqueado ? 0 : item.quantidadeTotal), 0);
+    const nomeImportadorFinal = inb.usuario?.nome || inb.usuario?.username || inb.usuarioImportadorNome || 'Sistema';
+    setInboundData({ id: inb.id, nome: inb.nomePallet, totalSku: inb.skus.length, totalUnidades: totalUnidadesCalc, status: inb.status, usuarioImportador: nomeImportadorFinal });
+    setSkus(inb.skus);
+    setMotoristaSelecionado(inb.motoristaId ? String(inb.motoristaId) : '');
+    setVeiculoSelecionado(inb.veiculoId ? String(inb.veiculoId) : '');
+    setCurrentScreen(3);
+    setSkuEmBipagem(null);
+  };
+
+  const handleAbrirProduto = (item: InboundSKU) => {
+    if (item.bloqueado) {
+      return toast.error('Este SKU está marcado como fora desta carga. Desbloqueie-o antes de bipar.');
+    }
+    if (!socket.connected) {
+      return toast.error('Sem conexão em tempo real. Recarregue a página antes de bipar.');
+    }
+    const dono = lockedSkus[lockKey(item.id)];
+    if (dono && dono !== getUsuarioLogado()) {
+      return toast.error(`${dono} já está conferindo este produto agora mesmo.`);
+    }
+
+    socket.emit('lock_sku', { skuId: lockKey(item.id), usuario: getUsuarioLogado() });
+    skuTravadoRef.current = item.id;
+
+    setSkuEmBipagem(item);
+    
+    
+    if (item.mascaraPredefinida) {
+      setMascaraSerie(item.mascaraPredefinida);
+    } else if (item.leituras && item.leituras.length > 0) {
+       const primeiraSerie = item.leituras.find(l => l.tipo === 'SERIE');
+       if (primeiraSerie) {
+         setModoBipagem('SERIE');
+         setMascaraSerie(gerarMascara(primeiraSerie.codigo));
+       } else {
+         setModoBipagem('SKU_EAN');
+         setMascaraSerie(null);
+       }
+    } else {
+       setMascaraSerie(null);
+    }
+  };
+
+  const fecharModoBipagem = () => {
+    if (skuTravadoRef.current != null) {
+      socket.emit('unlock_sku', { skuId: lockKey(skuTravadoRef.current) });
+      skuTravadoRef.current = null;
+    }
+    setSkuEmBipagem(null);
+    setIsScanning(false);
+    setModoTravado(false);
+    setCodigoLido('');
+    setShowSucessoProduto(false);
+    setTecladoLiberado(false); 
+  };
+
+  const salvarEdicaoAtivosTela3 = async () => {
+    if (!inboundData || !motoristaSelecionado || !veiculoSelecionado) return toast.error("Selecione motorista e veículo.");
+    
+    if (autoSaveTimeoutRef.current) clearTimeout(autoSaveTimeoutRef.current);
+
+    try {
+      const token = localStorage.getItem('wms_token');
+      const res = await fetch(`${API_URL}/inbounds/${inboundData.id}/finalizar`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ motoristaId: motoristaSelecionado, veiculoId: veiculoSelecionado, skus })
+      });
+      
+      if (!res.ok) {
+        if (res.status === 413) throw new Error('A carga é muito grande. Peça ao TI para aumentar o limite do servidor (413).');
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || 'Falha de comunicação com o servidor.');
+      }
+
+      toast.success("Informações salvas!"); carregarDashboard(); setCurrentScreen(1);
+    } catch (err: any) { 
+      toast.error(err.message || 'Erro inesperado.'); 
+    }
+  };
+
+  const handleIniciarBipagem = () => {
+    if (skuEmBipagem && skuEmBipagem.quantidadeBipada > 0) {
+      if (skuEmBipagem.leituras && skuEmBipagem.leituras.length > 0) setModoTravado(true);
+    }
+    setIsScanning(true);
+  };
+
+  const handleConfirmarModo = (modo: 'SKU_EAN' | 'SERIE') => {
+    setModoConfirmModal({ isOpen: true, novoModo: modo });
+  };
+
+  const resetarMascara = () => {
+    if (skuEmBipagem?.mascaraPredefinida) {
+      return toast.error('Atenção: Este produto possui uma máscara OBRIGATÓRIA de fábrica. Não é possível resetar.');
+    }
+    setMascaraSerie(null);
+    toast.success('Padrão de Série resetado. Bipe o próximo serial.');
+    if (inputBipagemRef.current) inputBipagemRef.current.focus();
+  };
+
+  const handleBipar = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!skuEmBipagem || !codigoLido.trim()) return;
+    const codigoLimpo = codigoLido.trim().toUpperCase();
+    let isValid = false;
+    const isSku = codigoLimpo === skuEmBipagem.sku.toUpperCase();
+    const isEan = skuEmBipagem.variacoes?.some(v => v.codigoUniversal !== 'N/A' && v.codigoUniversal.toUpperCase() === codigoLimpo) || false;
+
+    if (modoBipagem === 'SKU_EAN') {
+      if (isSku || isEan) isValid = true;
+      else { tocarSom('invalido'); toast.error('Código inválido! Este NÃO é o SKU/EAN deste produto.'); setCodigoLido(''); return; }
+    } else if (modoBipagem === 'SERIE') {
+      if (isSku || isEan) { tocarSom('invalido'); toast.error('Você bipou um SKU/EAN no campo de Série!'); setCodigoLido(''); return; }
+      if (skuEmBipagem.leituras?.some(l => l.codigo === codigoLimpo)) { tocarSom('erro'); toast.error('Duplicidade: Número JÁ FOI bipado!'); setCodigoLido(''); return; }
+      
+      
+      if (!mascaraSerie) { 
+        setMascaraSerie(gerarMascara(codigoLimpo)); 
+        isValid = true; 
+      } else {
+        if (validarMascara(codigoLimpo, mascaraSerie)) {
+          isValid = true;
+        } else { 
+          tocarSom('invalido'); 
+          toast.error(`Incorreto! Padrão exigido: ${mascaraSerie}`); 
+          setCodigoLido(''); 
+          return; 
+        }
+      }
+    }
+
+    if (isValid) {
+      if (skuEmBipagem.quantidadeBipada >= skuEmBipagem.quantidadeTotal) { tocarSom('erro'); toast.error('Quantidade total atingida!'); setCodigoLido(''); return; }
+      
+      tocarSom('sucesso');
+      
+      const novaLeitura: Leitura = { 
+        id: Math.random().toString(36).substring(2, 11), 
+        codigo: codigoLimpo, 
+        tipo: modoBipagem, 
+        data: new Date().toISOString(),
+        usuarioNome: getUsuarioLogado() 
+      };
+      
+      const novaQtd = skuEmBipagem.quantidadeBipada + 1;
+      const novoStatusSku = novaQtd >= skuEmBipagem.quantidadeTotal ? 'CONCLUIDO' : 'EM_PROCESSO';
+      
+      const updatedSkus = skus.map(s => {
+        if (s.id === skuEmBipagem.id) return { ...s, quantidadeBipada: novaQtd, status: novoStatusSku as any, leituras: [...(s.leituras || []), novaLeitura] };
+        return s;
+      });
+
+      setSkus(updatedSkus);
+      setSkuEmBipagem(updatedSkus.find(s => s.id === skuEmBipagem.id) || null);
+      autoSalvarBackground(updatedSkus);
+
+      const todosConcluidosLocal = updatedSkus.every(sku => sku.quantidadeBipada >= sku.quantidadeTotal);
+      
+      if (todosConcluidosLocal) {
+        setInboundData((prev: any) => prev ? { ...prev, status: 'CONCLUIDO' } : null);
+        setShowSucessoProduto(true);
+        setTimeout(() => { fecharModoBipagem(); toast.success('Carga Concluída!'); }, 1500);
+      } else if (novaQtd >= skuEmBipagem.quantidadeTotal) {
+        setShowSucessoProduto(true);
+        setTimeout(() => { fecharModoBipagem(); }, 1500);
+      }
+    }
+    setCodigoLido(''); 
+  };
+
+  const handleRemoverLeitura = (idLeitura: string) => {
+    if (!skuEmBipagem) return;
+    const updatedSkus = skus.map(s => {
+      if (s.id === skuEmBipagem.id) {
+        const leiturasRestantes = (s.leituras || []).filter(l => l.id !== idLeitura);
+        const novaQtd = Math.max(0, s.quantidadeBipada - 1);
+        const novoStatus = novaQtd === 0 ? 'PENDENTE' : 'EM_PROCESSO';
+        return { ...s, quantidadeBipada: novaQtd, status: novoStatus as any, leituras: leiturasRestantes };
+      }
+      return s;
+    });
+    setSkus(updatedSkus);
+    setSkuEmBipagem(updatedSkus.find(s => s.id === skuEmBipagem.id) || null);
+    autoSalvarBackground(updatedSkus);
+  };
+
+  
+  const handleToggleBloqueio = async (item: InboundSKU) => {
+    const vaiBloquear = !item.bloqueado;
+    if (vaiBloquear) {
+      const confirmado = await toast.confirm(`Marcar o SKU ${item.sku} como fora desta carga? Ele vai parar de contar na meta de conclusão do envio.`);
+      if (!confirmado) return;
+    }
+    const updatedSkus = skus.map(s => s.id === item.id ? { ...s, bloqueado: vaiBloquear } : s);
+    setSkus(updatedSkus);
+    autoSalvarBackground(updatedSkus);
+    toast.success(vaiBloquear ? `SKU ${item.sku} marcado como fora desta carga.` : `SKU ${item.sku} voltou a fazer parte da carga.`);
+  };
+
+  const toggleFiltro = (status: 'PENDENTE' | 'EM_PROCESSO' | 'CONCLUIDO' | 'ENVIADO') => { setFiltros(prev => ({ ...prev, [status]: !(prev as any)[status] })); };
+  const toggleTodos = () => {
+    const todosAtivos = filtros.PENDENTE && filtros.EM_PROCESSO && filtros.CONCLUIDO && filtros.ENVIADO;
+    setFiltros({ PENDENTE: !todosAtivos, EM_PROCESSO: !todosAtivos, CONCLUIDO: !todosAtivos, ENVIADO: !todosAtivos });
+  };
+
+  const HeaderGlobal = ({ showClose = true, onClose = () => navigate('/') }) => (
+    <div className="p-4 border-b border-[var(--border-color)] bg-[var(--bg-panel)] sticky top-0 z-10 flex items-center justify-between min-h-[80px]">
+      {showClose ? (
+        <button onClick={onClose} className="w-10 h-10 flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-main)] bg-[var(--bg-main)] hover:bg-[var(--border-color)] rounded-full transition shadow-sm border border-[var(--border-color)]">
+          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M15 19l-7-7 7-7" /></svg>
+        </button>
+      ) : <div className="w-10 h-10"></div>}
+      <div className="flex-1 flex items-center justify-center gap-2">
+        <span className="text-[#00a650] italic font-black text-[24px] leading-none tracking-tight flex items-center">
+          <svg className="w-5 h-5 mr-0.5 fill-[#00a650] stroke-[#00a650]" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" /></svg> FULL
+        </span>
+        <span className="font-bold text-[var(--text-main)] text-base uppercase tracking-widest mt-0.5">Gestor de Envios</span>
+      </div>
+      <div className="w-10 h-10"></div>
+    </div>
+  );
+
+  const countPendente = dashboardData.inbounds?.filter(i => i.status === 'PENDENTE').length || 0;
+  const countProcesso = dashboardData.inbounds?.filter(i => i.status === 'EM_PROCESSO').length || 0;
+  const countConcluido = dashboardData.inbounds?.filter(i => i.status === 'CONCLUIDO').length || 0;
+  const countEnviado = dashboardData.inbounds?.filter(i => i.status === 'ENVIADO').length || 0;
+
+  const inboundsFiltrados = dashboardData.inbounds?.filter(inb => {
+    if (dataInicio && dataFim && inb.createdAt) {
+      const itemDate = new Date(inb.createdAt).toISOString().split('T')[0];
+      if (itemDate < dataInicio || itemDate > dataFim) return false;
+    }
+    if (inb.status === 'PENDENTE' && !filtros.PENDENTE) return false;
+    if (inb.status === 'EM_PROCESSO' && !filtros.EM_PROCESSO) return false;
+    if (inb.status === 'CONCLUIDO' && !filtros.CONCLUIDO) return false;
+    if (inb.status === 'ENVIADO' && !filtros.ENVIADO) return false;
+
+    if (!termoBusca) return true; 
+    const termo = termoBusca.toLowerCase();
+    if (inb.nomePallet.toLowerCase().includes(termo)) return true;
+    if (inb.status.toLowerCase().includes(termo)) return true;
+    if (inb.createdAt && inb.createdAt.includes(termo)) return true;
+    if (inb.motorista?.nome && inb.motorista.nome.toLowerCase().includes(termo)) return true;
+    if (inb.veiculo?.placa && inb.veiculo.placa.toLowerCase().includes(termo)) return true;
+
+    return inb.skus?.some((skuObj: any) => {
+      if (skuObj.sku.toLowerCase().includes(termo)) return true;
+      if (skuObj.variacoes?.some((v: any) => v.codigoUniversal && v.codigoUniversal.toLowerCase().includes(termo))) return true;
+      let leiturasArray = []; try { leiturasArray = typeof skuObj.leituras === 'string' ? JSON.parse(skuObj.leituras) : (skuObj.leituras || []); } catch(e){}
+      return leiturasArray.some((l: any) => l.codigo && l.codigo.toLowerCase().includes(termo));
+    });
+  }) || [];
+
+  const todosSkusConcluidosNaTela = skus.length > 0 && skus.every(s => s.bloqueado || s.quantidadeBipada >= s.quantidadeTotal);
+
+  
+  useEffect(() => { setPagina(1); }, [termoBusca, filtros, dataInicio, dataFim]);
+  const totalPaginas = Math.max(1, Math.ceil(inboundsFiltrados.length / POR_PAGINA));
+  const paginaSegura = Math.min(pagina, totalPaginas);
+  const inboundsPagina = inboundsFiltrados.slice((paginaSegura - 1) * POR_PAGINA, paginaSegura * POR_PAGINA);
+
+  return (
+    <div className="min-h-screen bg-[var(--bg-main)] md:p-8 flex items-start justify-center font-sans antialiased relative">
+      
+      {}
+      {modoConfirmModal.isOpen && (
+        <div className="fixed inset-0 z-[120] w-screen h-screen flex items-center justify-center bg-slate-900/40 backdrop-blur-[3px] p-4 animate-in fade-in duration-200">
+          <div className="bg-[var(--bg-panel)] rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden">
+            <div className="p-4 border-b bg-blue-600 flex justify-between items-center text-white">
+              <h3 className="font-bold">Confirmação de Modo</h3>
+              <button type="button" onClick={() => setModoConfirmModal({ isOpen: false, novoModo: null })} className="hover:opacity-75">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg>
+              </button>
+            </div>
+            <div className="p-6 text-center">
+              <p className="text-sm text-[var(--text-muted)] mb-6 leading-relaxed">
+                Deseja fixar o modo de bipagem como <strong>{modoConfirmModal.novoModo === 'SERIE' ? 'NÚMERO DE SÉRIE' : 'SKU / EAN'}</strong>?<br/><br/>
+                <span className="text-blue-600 font-bold">Isso garantirá o padrão na leitura deste item!</span>
+              </p>
+              <div className="flex gap-3 mt-4">
+                <button type="button" onClick={() => setModoConfirmModal({ isOpen: false, novoModo: null })} className="flex-1 py-3 text-sm font-bold text-[var(--text-muted)] bg-[var(--bg-main)] hover:bg-[var(--border-color)] rounded-xl transition">Cancelar</button>
+                <button type="button" onClick={() => { 
+                    setModoBipagem(modoConfirmModal.novoModo as any); 
+                    setModoTravado(true); 
+                    setModoConfirmModal({ isOpen: false, novoModo: null }); 
+                  }} 
+                  className="flex-1 font-bold py-3 rounded-xl transition shadow-md text-white bg-blue-600 hover:bg-blue-700">Confirmar
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {modalCoord.isOpen && (
+        <div className="fixed inset-0 z-[110] w-screen h-screen flex items-center justify-center bg-slate-900/40 backdrop-blur-[3px] p-4">
+          <div className="bg-[var(--bg-panel)] rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden">
+            <div className={`p-4 border-b flex justify-between items-center text-white ${modalCoord.acao === 'EXCLUIR' ? 'bg-red-600' : 'bg-blue-600'}`}>
+              <h3 className="font-bold">Confirmação de Ação</h3>
+              <button type="button" onClick={() => setModalCoord({ isOpen: false, inboundId: null, acao: null, nomePallet: '' })} className="hover:opacity-75"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg></button>
+            </div>
+            <form onSubmit={handleAcaoCoordenador} className="p-6 text-center">
+              <p className="text-sm text-[var(--text-muted)] mb-6 leading-relaxed">Você tem certeza que deseja <strong>{modalCoord.acao === 'EXCLUIR' ? 'APAGAR' : 'DESPACHAR'}</strong> o envio abaixo?<br/><br/><span className="font-bold text-[var(--text-main)] text-lg border-b-2 border-[var(--border-color)] pb-1">{modalCoord.nomePallet}</span></p>
+              <div className="flex gap-3 mt-4">
+                <button type="button" onClick={() => setModalCoord({ isOpen: false, inboundId: null, acao: null, nomePallet: '' })} className="flex-1 py-3 text-sm font-bold text-[var(--text-muted)] bg-[var(--bg-main)] hover:bg-[var(--border-color)] rounded-xl transition">Cancelar</button>
+                <button type="submit" className={`flex-1 font-bold py-3 rounded-xl transition shadow-md text-white ${modalCoord.acao === 'EXCLUIR' ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'}`}>Confirmar</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showModalMotorista && (
+        <div className="fixed inset-0 z-[100] w-screen h-screen flex items-center justify-center bg-slate-900/30 backdrop-blur-[3px] p-4">
+          <div className="bg-[var(--bg-panel)] rounded-2xl shadow-xl w-full max-w-sm overflow-hidden">
+            <div className="bg-[var(--bg-main)] p-4 border-b flex justify-between items-center"><h3 className="font-bold">Cadastrar Motorista</h3><button onClick={() => setShowModalMotorista(false)}><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg></button></div>
+            <form onSubmit={handleSalvarMotorista} className="p-5">
+              <input type="text" value={nomeMotorista} onChange={(e) => setNomeMotorista(e.target.value)} placeholder="Nome Completo" className="w-full border rounded-lg p-3 text-sm mb-5 focus:ring-2 focus:ring-blue-500" autoFocus/>
+              <button type="submit" className="w-full bg-blue-600 text-white font-bold py-3 rounded-xl hover:bg-blue-700">Salvar</button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showModalVeiculo && (
+        <div className="fixed inset-0 z-[100] w-screen h-screen flex items-center justify-center bg-slate-900/30 backdrop-blur-[3px] p-4">
+          <div className="bg-[var(--bg-panel)] rounded-2xl shadow-xl w-full max-w-sm overflow-hidden">
+            <div className="bg-[var(--bg-main)] p-4 border-b flex justify-between items-center"><h3 className="font-bold">Cadastrar Veículo</h3><button onClick={() => setShowModalVeiculo(false)}><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg></button></div>
+            <form onSubmit={handleSalvarVeiculo} className="p-5">
+              <input type="text" value={nomeVeiculo} onChange={(e) => setNomeVeiculo(e.target.value)} placeholder="Modelo / Nome" className="w-full border rounded-lg p-3 text-sm mb-4 focus:ring-2 focus:ring-blue-500" autoFocus/>
+              <input type="text" value={placaVeiculo} onChange={(e) => setPlacaVeiculo(e.target.value.toUpperCase())} placeholder="ABC-1234" maxLength={8} className="w-full border rounded-lg p-3 text-sm mb-5 uppercase tracking-widest font-bold focus:ring-2 focus:ring-blue-500"/>
+              <button type="submit" className="w-full bg-blue-600 text-white font-bold py-3 rounded-xl hover:bg-blue-700">Salvar</button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {showModalMascaras && (
+        <div className="fixed inset-0 z-[100] w-screen h-screen flex items-center justify-center bg-slate-900/30 backdrop-blur-[3px] p-4">
+          <div className="bg-[var(--bg-panel)] rounded-2xl shadow-xl w-full max-w-md overflow-hidden max-h-[90vh] flex flex-col">
+            <div className="bg-[var(--bg-main)] p-4 border-b flex justify-between items-center">
+              <h3 className="font-bold">Máscaras</h3>
+              <button onClick={fecharModalMascaras}><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" /></svg></button>
+            </div>
+
+            {mascaraView === 'senha' && (
+              <form onSubmit={handleVerificarSenhaMascara} className="p-5">
+                <p className="text-sm text-[var(--text-muted)] mb-4">Esta tela é protegida por uma senha própria, separada do seu login. Informe-a para gerenciar as máscaras.</p>
+                <input type="password" autoComplete="off" value={mascaraSenhaInput} onChange={(e) => setMascaraSenhaInput(e.target.value)} placeholder="Senha de máscaras" className="w-full border rounded-lg p-3 text-sm mb-5 focus:ring-2 focus:ring-amber-500" autoFocus/>
+                <button type="submit" disabled={mascaraCarregando} className="w-full bg-amber-500 text-white font-bold py-3 rounded-xl hover:bg-amber-600 disabled:opacity-60">Entrar</button>
+              </form>
+            )}
+
+            {mascaraView === 'definirSenha' && (
+              <form onSubmit={handleDefinirSenhaMascaraInicial} className="p-5">
+                <p className="text-sm text-[var(--text-muted)] mb-4">Nenhuma senha foi definida ainda para esta tela. Crie uma agora (guarde-a e repasse só a quem for cadastrar máscaras).</p>
+                <input type="password" autoComplete="off" value={mascaraNovaSenha} onChange={(e) => setMascaraNovaSenha(e.target.value)} placeholder="Nova senha (mín. 4 caracteres)" className="w-full border rounded-lg p-3 text-sm mb-5 focus:ring-2 focus:ring-amber-500" autoFocus/>
+                <button type="submit" disabled={mascaraCarregando} className="w-full bg-amber-500 text-white font-bold py-3 rounded-xl hover:bg-amber-600 disabled:opacity-60">Definir senha e entrar</button>
+              </form>
+            )}
+
+            {mascaraView === 'trocarSenha' && (
+              <form onSubmit={handleTrocarSenhaMascara} className="p-5">
+                <input type="password" autoComplete="off" value={mascaraSenhaAtualTroca} onChange={(e) => setMascaraSenhaAtualTroca(e.target.value)} placeholder="Senha atual" className="w-full border rounded-lg p-3 text-sm mb-3 focus:ring-2 focus:ring-amber-500" autoFocus/>
+                <input type="password" autoComplete="off" value={mascaraNovaSenhaTroca} onChange={(e) => setMascaraNovaSenhaTroca(e.target.value)} placeholder="Nova senha (mín. 4 caracteres)" className="w-full border rounded-lg p-3 text-sm mb-5 focus:ring-2 focus:ring-amber-500"/>
+                <div className="flex gap-3">
+                  <button type="button" onClick={() => setMascaraView('lista')} className="flex-1 py-3 text-sm font-bold text-[var(--text-muted)] bg-[var(--bg-main)] hover:bg-[var(--border-color)] rounded-xl transition">Cancelar</button>
+                  <button type="submit" className="flex-1 bg-amber-500 text-white font-bold py-3 rounded-xl hover:bg-amber-600">Trocar senha</button>
+                </div>
+              </form>
+            )}
+
+            {mascaraView === 'lista' && (
+              <div className="p-5 overflow-y-auto flex-1 flex flex-col">
+                <p className="text-xs text-[var(--text-muted)] mb-3 leading-relaxed"><strong>Legenda:</strong> <code># = número</code> · <code>@ = letra</code> · <code>* = letra ou número</code> · qualquer outro caractere é exigido exatamente como escrito (ex: B, R, -). Edite o objeto abaixo (um SKU por linha) e salve — quem sumir do texto é removido.</p>
+
+                <textarea
+                  value={mascarasJson}
+                  onChange={(e) => setMascarasJson(e.target.value)}
+                  spellCheck={false}
+                  autoComplete="off"
+                  className="w-full flex-1 min-h-[280px] bg-slate-950 text-emerald-400 font-mono text-sm leading-relaxed rounded-xl p-4 border border-[var(--border-color)] focus:ring-2 focus:ring-amber-500 resize-y"
+                />
+
+                <button onClick={handleSincronizarMascaras} className="w-full mt-3 bg-amber-500 text-white font-bold py-2.5 rounded-lg hover:bg-amber-600 text-sm">Salvar máscaras</button>
+                <button onClick={() => setMascaraView('trocarSenha')} className="w-full mt-4 text-xs font-bold text-[var(--text-muted)] hover:text-[var(--text-main)] underline">Trocar a senha desta tela</button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="w-full min-h-screen md:min-h-0 md:max-w-2xl bg-[var(--bg-panel)] md:rounded-2xl md:shadow-xl border border-[var(--border-color)] flex flex-col overflow-hidden transition-all duration-300">
+        
+        {}
+        {currentScreen === 1 && (
+          <div className="flex flex-col h-full animate-in fade-in duration-300">
+            <div className="p-4 border-b border-[var(--border-color)] bg-[var(--bg-panel)] sticky top-0 z-10 flex items-center justify-between min-h-[80px]">
+              <div className="w-10 h-10"></div> 
+              <div className="flex-1 flex items-center justify-center gap-2">
+                <span className="text-[#00a650] italic font-black text-[24px] leading-none tracking-tight flex items-center">
+                  <svg className="w-5 h-5 mr-0.5 fill-[#00a650] stroke-[#00a650]" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" /></svg>
+                  FULL
+                </span>
+                <span className="font-bold text-[var(--text-main)] text-base uppercase tracking-widest mt-0.5">Gestor de Envios</span>
+              </div>
+              <div className="w-10 h-10"></div>
+            </div>
+            
+            <div className="p-5 flex-1 bg-[var(--bg-main)] flex flex-col overflow-y-auto">
+              
+              <button onClick={() => setCurrentScreen(2)} className="w-full bg-blue-600 text-white font-semibold py-4 rounded-xl mb-6 flex items-center justify-center gap-2 transition hover:bg-blue-700 shadow-md">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4"/></svg> Adicionar Novo Envio
+              </button>
+              
+              <h3 className="font-bold text-[var(--text-main)] text-xs uppercase tracking-wider mb-3 mt-2">Gerenciamento de Ativos</h3>
+              <div className="grid grid-cols-2 gap-3 mb-4 items-start">
+                <button onClick={() => setShowModalMotorista(true)} className="w-full bg-[var(--bg-panel)] border border-blue-500 text-blue-600 font-bold py-2.5 rounded-xl flex items-center justify-center gap-2 hover:bg-blue-500/10 transition"><span className="text-lg leading-none">+</span> Motorista</button>
+                <button onClick={() => setShowModalVeiculo(true)} className="w-full bg-[var(--bg-panel)] border border-blue-500 text-blue-600 font-bold py-2.5 rounded-xl flex items-center justify-center gap-2 hover:bg-blue-500/10 transition"><span className="text-lg leading-none">+</span> Veículo</button>
+                <button onClick={() => { setShowModalMascaras(true); setMascaraView(mascaraToken ? 'lista' : 'senha'); if (mascaraToken) carregarMascarasLista(mascaraToken); }} className="w-full col-span-2 bg-[var(--bg-panel)] border border-amber-500 text-amber-600 font-bold py-2.5 rounded-xl flex items-center justify-center gap-2 hover:bg-amber-500/10 transition">🔒 Máscaras de SKU</button>
+              </div>
+              
+              <div className="grid grid-cols-2 gap-3 mb-6 items-start">
+                <div className="border border-[var(--border-color)] bg-[var(--bg-panel)] rounded-lg overflow-hidden shadow-sm h-max">
+                  <button onClick={() => { setShowMotoristasList(!showMotoristasList); setShowVeiculosList(false); }} className="w-full px-3 py-2 flex items-center justify-between bg-[var(--bg-panel)] hover:bg-[var(--bg-main)] transition">
+                    <span className="text-[11px] font-bold text-[var(--text-muted)] uppercase flex items-center gap-1.5"><svg className="w-4 h-4 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg> Motoristas</span>
+                    <svg className={`w-3.5 h-3.5 text-[var(--text-muted)] transition-transform ${showMotoristasList ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"/></svg>
+                  </button>
+                  {showMotoristasList && (
+                    <div className="p-2 max-h-48 overflow-y-auto space-y-1 border-t border-[var(--border-color)]">
+                      {dashboardData.motoristas?.length > 0 ? ( dashboardData.motoristas.map(m => (<div key={m.id} className="text-xs text-[var(--text-main)] py-1.5 px-2 hover:bg-[var(--bg-main)] rounded uppercase font-medium">{m.nome}</div>)) ) : (<div className="text-[10px] text-[var(--text-muted)] italic p-2 text-center">Vazio</div>)}
+                    </div>
+                  )}
+                </div>
+
+                <div className="border border-[var(--border-color)] bg-[var(--bg-panel)] rounded-lg overflow-hidden shadow-sm h-max">
+                  <button onClick={() => { setShowVeiculosList(!showVeiculosList); setShowMotoristasList(false); }} className="w-full px-3 py-2 flex items-center justify-between bg-[var(--bg-panel)] hover:bg-[var(--bg-main)] transition">
+                    <span className="text-[11px] font-bold text-[var(--text-muted)] uppercase flex items-center gap-1.5"><svg className="w-4 h-4 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"/></svg> Veículos</span>
+                    <svg className={`w-3.5 h-3.5 text-[var(--text-muted)] transition-transform ${showVeiculosList ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"/></svg>
+                  </button>
+                  {showVeiculosList && (
+                    <div className="p-2 max-h-48 overflow-y-auto space-y-1 border-t border-[var(--border-color)]">
+                      {dashboardData.veiculos?.length > 0 ? ( dashboardData.veiculos.map(v => (<div key={v.id} className="text-xs text-[var(--text-main)] py-1.5 px-2 hover:bg-[var(--bg-main)] rounded uppercase font-medium flex justify-between"><span>{v.modelo}</span><span className="font-bold text-[var(--text-muted)]">{v.placa}</span></div>)) ) : (<div className="text-[10px] text-[var(--text-muted)] italic p-2 text-center">Vazio</div>)}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="relative mb-3">
+                <svg className="w-4 h-4 absolute left-3.5 top-3.5 text-[var(--text-muted)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+                <input type="text" placeholder="Buscar por Pallet, Motorista, Placa, Série, EAN..." value={termoBusca} onChange={(e) => setTermoBusca(e.target.value)} className="w-full pl-10 pr-4 py-3 bg-[var(--bg-panel)] border border-blue-500 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 shadow-sm transition placeholder:text-[var(--text-muted)] font-medium" />
+              </div>
+
+              <div className="mb-4 mt-2">
+                <label className="font-bold text-[var(--text-main)] text-xs uppercase tracking-wider mb-3 block">Data</label>
+                <div className="flex items-center w-full border border-[var(--border-color)] rounded-lg overflow-hidden shadow-sm bg-[var(--bg-panel)]">
+                  <input type="date" value={dataInicio} onChange={(e) => setDataInicio(e.target.value)} className="flex-1 p-2.5 text-sm text-[var(--text-main)] focus:outline-none focus:bg-[var(--bg-main)] transition" />
+                  <div className="bg-[var(--bg-main)] px-3 py-3 text-sm font-medium text-[var(--text-muted)] border-x border-[var(--border-color)]">Até</div>
+                  <input type="date" value={dataFim} onChange={(e) => setDataFim(e.target.value)} className="flex-1 p-2.5 text-sm text-[var(--text-main)] focus:outline-none focus:bg-[var(--bg-main)] transition" />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-2 mb-6 border-b border-[var(--border-color)] pb-6">
+                <label className={`flex items-center gap-1.5 cursor-pointer bg-[var(--bg-panel)] px-3 py-2 rounded-lg border ${filtros.PENDENTE && filtros.EM_PROCESSO && filtros.CONCLUIDO && filtros.ENVIADO ? 'border-[var(--text-muted)] text-[var(--text-main)]' : 'border-[var(--border-color)] text-[var(--text-muted)]'} shadow-sm text-xs font-bold transition`}>
+                  <input type="checkbox" checked={filtros.PENDENTE && filtros.EM_PROCESSO && filtros.CONCLUIDO && filtros.ENVIADO} onChange={toggleTodos} style={{ accentColor: '#475569' }} className="w-4 h-4 rounded cursor-pointer" /> Marcar Todos
+                </label>
+                <label className={`flex items-center gap-1.5 cursor-pointer bg-[var(--bg-panel)] px-3 py-2 rounded-lg border ${filtros.PENDENTE ? 'border-red-500 text-rose-600' : 'border-[var(--border-color)] text-[var(--text-muted)]'} shadow-sm text-xs font-bold transition`}>
+                  <input type="checkbox" checked={filtros.PENDENTE} onChange={() => toggleFiltro('PENDENTE')} style={{ accentColor: '#ef4444' }} className="w-4 h-4 rounded cursor-pointer" />
+                  Envio Importado <span className={`ml-1 text-[13px] font-black ${filtros.PENDENTE ? 'text-rose-600' : 'text-[var(--text-muted)]'}`}>{countPendente}</span>
+                </label>
+                <label className={`flex items-center gap-1.5 cursor-pointer bg-[var(--bg-panel)] px-3 py-2 rounded-lg border ${filtros.EM_PROCESSO ? 'border-blue-500 text-blue-600' : 'border-[var(--border-color)] text-[var(--text-muted)]'} shadow-sm text-xs font-bold transition`}>
+                  <input type="checkbox" checked={filtros.EM_PROCESSO} onChange={() => toggleFiltro('EM_PROCESSO')} style={{ accentColor: '#3b82f6' }} className="w-4 h-4 rounded cursor-pointer" />
+                  Em Processo <span className={`ml-1 text-[13px] font-black ${filtros.EM_PROCESSO ? 'text-blue-600' : 'text-[var(--text-muted)]'}`}>{countProcesso}</span>
+                </label>
+                <label className={`flex items-center gap-1.5 cursor-pointer bg-[var(--bg-panel)] px-3 py-2 rounded-lg border ${filtros.CONCLUIDO ? 'border-yellow-400 text-yellow-600' : 'border-[var(--border-color)] text-[var(--text-muted)]'} shadow-sm text-xs font-bold transition`}>
+                  <input type="checkbox" checked={filtros.CONCLUIDO} onChange={() => toggleFiltro('CONCLUIDO')} style={{ accentColor: '#eab308' }} className="w-4 h-4 rounded cursor-pointer" />
+                  Prontos <span className={`ml-1 text-[13px] font-black ${filtros.CONCLUIDO ? 'text-yellow-600' : 'text-[var(--text-muted)]'}`}>{countConcluido}</span>
+                </label>
+                <label className={`flex items-center gap-1.5 cursor-pointer bg-[var(--bg-panel)] px-3 py-2 rounded-lg border ${filtros.ENVIADO ? 'border-blue-500 text-blue-600' : 'border-[var(--border-color)] text-[var(--text-muted)]'} shadow-sm text-xs font-bold transition`}>
+                  <input type="checkbox" checked={filtros.ENVIADO} onChange={() => toggleFiltro('ENVIADO')} style={{ accentColor: '#22c55e' }} className="w-4 h-4 rounded cursor-pointer" />
+                  Enviados <span className={`ml-1 text-[13px] font-black ${filtros.ENVIADO ? 'text-blue-600' : 'text-[var(--text-muted)]'}`}>{countEnviado}</span>
+                </label>
+              </div>
+
+              <h3 className="font-bold text-[var(--text-main)] text-xs uppercase tracking-wider mb-4 border-b pb-2">Envios Recentes</h3>
+              <div className="space-y-4">
+                {inboundsPagina.map(inb => {
+                  let corBolinha = 'bg-rose-500';
+                  let textoStatus = 'Envio Importado';
+                  let statusClasses = 'text-rose-600 bg-rose-500/10 border-rose-500/20';
+
+                  if (inb.status === 'EM_PROCESSO') { corBolinha = 'bg-blue-500'; textoStatus = 'Em processo de bipagem'; statusClasses = 'text-blue-600 bg-blue-500/10 border-blue-500/20'; }
+                  else if (inb.status === 'CONCLUIDO') { corBolinha = 'bg-amber-500'; textoStatus = 'Prontos para envio'; statusClasses = 'text-amber-600 bg-amber-500/10 border-amber-500/20'; }
+                  else if (inb.status === 'ENVIADO') { corBolinha = 'bg-emerald-500'; textoStatus = 'Produtos enviados'; statusClasses = 'text-emerald-600 bg-emerald-500/10 border-emerald-500/20'; }
+
+                  const totalEsperado = inb.skus.reduce((a:number, s:any) => a + (s.bloqueado ? 0 : s.quantidadeTotal), 0);
+                  const totalBipado = inb.skus.reduce((a:number, s:any) => a + (s.bloqueado ? 0 : s.quantidadeBipada), 0);
+
+                  const bloqueiosNestePallet = inb.skus.filter((sku: any) => lockedSkus[lockKey(sku.id)] && lockedSkus[lockKey(sku.id)] !== getUsuarioLogado());
+
+                  return (
+                    <div key={inb.id} className="bg-[var(--bg-panel)] border border-[var(--border-color)] rounded-xl p-4 shadow-sm relative transition hover:shadow-md cursor-pointer" onClick={(e) => { if ((e.target as HTMLElement).closest('button')) return; abrirEnvioCompleto(inb); }}>
+                      {inb.status !== 'ENVIADO' && (
+                        <button onClick={() => setModalCoord({ isOpen: true, inboundId: inb.id, acao: 'EXCLUIR', nomePallet: inb.nomePallet })} className="absolute top-4 right-4 text-red-300 hover:text-rose-600 transition p-1" title="Apagar Envio"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg></button>
+                      )}
+                      {inb.status === 'ENVIADO' && (
+                        <button onClick={(e) => { e.stopPropagation(); handleReimprimir(inb); }} className="absolute top-4 right-4 text-blue-600 hover:text-blue-700 transition p-1.5 bg-blue-500/10 rounded-lg border border-blue-500/30 shadow-sm" title="Reimprimir Relatório"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg></button>
+                      )}
+
+                      <h4 className="font-black text-[var(--text-main)] text-xl mb-1 pr-12 leading-tight break-words">{inb.nomePallet}</h4>
+                      <div className="flex gap-4 text-xs font-bold text-[var(--text-muted)] mb-4"><span>SKUs: {inb.skus.length}</span><span>UNIDADES: {totalBipado} / {totalEsperado}</span></div>
+                      
+                      <div className="flex items-center justify-between mb-4">
+                        <div className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-md border text-[11px] font-bold ${statusClasses}`}><span className={`w-2 h-2 rounded-full ${corBolinha}`}></span>{textoStatus}</div>
+                        {bloqueiosNestePallet.length > 0 && (
+                          <div className="text-[10px] text-amber-600 font-bold bg-amber-500/10 px-2 py-1 rounded border border-amber-500/30 animate-pulse">
+                            ⚠️ {bloqueiosNestePallet.length} em uso
+                          </div>
+                        )}
+                      </div>
+
+                      {(inb.status === 'PENDENTE' || inb.status === 'EM_PROCESSO') && (<button onClick={() => abrirEnvioCompleto(inb)} className="w-full py-2.5 bg-[var(--bg-main)] border border-[var(--border-color)] text-[var(--text-main)] font-bold rounded-lg hover:bg-[var(--border-color)] shadow-sm transition">Continuar Bipagem</button>)}
+                      {inb.status === 'CONCLUIDO' && (
+                        <div className="flex gap-2">
+                           <button onClick={() => setModalCoord({ isOpen: true, inboundId: inb.id, acao: 'ENVIAR', nomePallet: inb.nomePallet })} className="flex-[3] py-2.5 bg-amber-500/100 text-white font-bold rounded-lg hover:bg-yellow-600 shadow-md flex items-center justify-center gap-2 transition"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7"/></svg> ENVIAR</button>
+                        </div>
+                      )}
+                      {inb.status === 'ENVIADO' && (<button onClick={() => abrirEnvioCompleto(inb)} className="w-full py-2.5 bg-[var(--bg-panel)] border border-[var(--border-color)] text-[var(--text-muted)] font-bold rounded-lg hover:bg-[var(--bg-main)] shadow-sm transition flex items-center justify-center gap-1 text-[11px] uppercase">VER DETALHES DO ENVIO</button>)}
+                    </div>
+                  );
+                })}
+                {inboundsFiltrados.length === 0 && (<div className="text-center text-[var(--text-muted)] text-sm py-8 font-medium">Nenhum envio atende aos filtros atuais.</div>)}
+              </div>
+              <Paginador pagina={paginaSegura} totalPaginas={totalPaginas} onChange={setPagina} />
+            </div>
+          </div>
+        )}
+
+        {}
+        {currentScreen === 2 && (
+          <div className="flex flex-col h-full bg-[var(--bg-main)] animate-in slide-in-from-right-8 duration-300">
+            <HeaderGlobal onClose={() => setCurrentScreen(1)} />
+            <div className="p-5 flex-1">
+              <div className="bg-[var(--bg-panel)] border border-[var(--border-color)] rounded-2xl p-5 shadow-sm">
+                <input type="text" value={nomePallet} onChange={(e) => setNomePallet(e.target.value)} placeholder="Identificação do Pallet" className="w-full border border-[var(--border-color)] rounded-xl p-3.5 bg-[var(--bg-main)] text-sm mb-6" />
+                <input type="file" accept=".txt" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
+                <div onClick={() => fileInputRef.current?.click()} className="border-2 border-dashed border-[var(--border-color)] rounded-xl p-6 flex flex-col items-center mb-8 cursor-pointer hover:bg-[var(--bg-main)] transition">
+                  <span className="text-sm font-semibold text-[var(--text-muted)]">{selectedFile ? selectedFile.name : 'Anexar Inbound (TXT)'}</span>
+                </div>
+                <button onClick={handleProcessarNovo} disabled={isProcessing} className="w-full text-white bg-blue-600 font-bold py-4 rounded-xl shadow-md transition hover:bg-blue-700 active:scale-[0.98]">Processar</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {}
+        {currentScreen === 3 && inboundData && (
+          <div className="flex flex-col h-full bg-[var(--bg-main)] animate-in duration-300">
+            {skuEmBipagem ? (
+               <div className="p-4 border-b border-[var(--border-color)] bg-[var(--bg-panel)] sticky top-0 z-10 flex flex-col items-start min-h-[80px]">
+                 <div className="flex w-full justify-between items-center mb-3">
+                   <button onClick={fecharModoBipagem} className="w-10 h-10 flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-main)] bg-[var(--bg-main)] hover:bg-[var(--border-color)] rounded-full transition shadow-sm border border-[var(--border-color)]">
+                     <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M15 19l-7-7 7-7"/></svg>
+                   </button>
+                   <div className="flex-1 flex items-center justify-center gap-2">
+                     <span className="text-[#00a650] italic font-black text-[24px] leading-none tracking-tight flex items-center">
+                       <svg className="w-5 h-5 mr-0.5 fill-[#00a650] stroke-[#00a650]" viewBox="0 0 24 24" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" /></svg>
+                       FULL
+                     </span>
+                     <span className="font-bold text-[var(--text-main)] text-base uppercase tracking-widest mt-0.5">Gestor de Envios</span>
+                   </div>
+                   <div className="w-10"></div>
+                 </div>
+               </div>
+             ) : (
+               <HeaderGlobal onClose={() => { setCurrentScreen(1); carregarDashboard(); }} />
+             )}
+            
+            {!skuEmBipagem && (
+              <>
+                <div className="bg-[var(--bg-panel)] border-b border-[var(--border-color)] p-6">
+                  <div className="font-black text-2xl tracking-wide text-[var(--text-main)]">
+                    {inboundData.nome}
+                    <span className="block text-[10px] text-[var(--text-muted)] font-medium uppercase tracking-widest mt-1">Importado por: {inboundData.usuarioImportador || 'Sistema'}</span>
+                  </div>
+                  <div className="text-base text-[var(--text-muted)] mt-2 font-medium flex gap-4">
+                    <span><strong className="text-[var(--text-main)]">SKUs:</strong> {inboundData.totalSku}</span>
+                    <span><strong className="text-[var(--text-main)]">Unidades:</strong> {inboundData.totalUnidades}</span>
+                  </div>
+                </div>
+
+                {todosSkusConcluidosNaTela && inboundData.status !== 'ENVIADO' && (
+                  <div className="bg-[var(--bg-panel)] p-4 border-b border-[var(--border-color)] shadow-sm flex flex-col md:flex-row gap-4 items-end">
+                     <div className="flex-1 w-full">
+                        <label className="block text-[10px] font-bold text-[var(--text-muted)] uppercase mb-1.5">Motorista da Carga</label>
+                        <select value={motoristaSelecionado} onChange={(e) => setMotoristaSelecionado(e.target.value)} className="w-full border border-[var(--border-color)] rounded-lg p-3 text-sm focus:ring-2 focus:ring-blue-500 bg-[var(--bg-main)]">
+                          <option value="">-- Selecione um Motorista --</option>
+                          {dashboardData.motoristas?.map(m => <option key={m.id} value={m.id}>{m.nome}</option>)}
+                        </select>
+                     </div>
+                     <div className="flex-1 w-full">
+                        <label className="block text-[10px] font-bold text-[var(--text-muted)] uppercase mb-1.5">Veículo de Transporte</label>
+                        <select value={veiculoSelecionado} onChange={(e) => setVeiculoSelecionado(e.target.value)} className="w-full border border-[var(--border-color)] rounded-lg p-3 text-sm focus:ring-2 focus:ring-blue-500 bg-[var(--bg-main)]">
+                          <option value="">-- Selecione um Veículo --</option>
+                          {dashboardData.veiculos?.map(v => <option key={v.id} value={v.id}>{v.modelo} ({v.placa})</option>)}
+                        </select>
+                     </div>
+                     <button onClick={salvarEdicaoAtivosTela3} className="w-full md:w-auto bg-blue-600 text-white font-bold py-3 px-6 rounded-lg hover:bg-blue-700 transition shadow-sm">
+                        Salvar Alterações
+                     </button>
+                  </div>
+                )}
+
+                {inboundData.status === 'ENVIADO' && (
+                  <div className="bg-[var(--bg-panel)] p-4 border-b border-[var(--border-color)] shadow-sm flex flex-col md:flex-row gap-4 items-end">
+                     <div className="flex-1 w-full">
+                        <label className="block text-[10px] font-bold text-[var(--text-muted)] uppercase mb-1.5">Motorista da Carga</label>
+                        <select value={motoristaSelecionado} disabled className="w-full border border-[var(--border-color)] rounded-lg p-3 text-sm bg-[var(--bg-main)] text-[var(--text-muted)] cursor-not-allowed">
+                          <option>{dashboardData.motoristas?.find(m => m.id === Number(motoristaSelecionado))?.nome || '--'}</option>
+                        </select>
+                     </div>
+                     <div className="flex-1 w-full">
+                        <label className="block text-[10px] font-bold text-[var(--text-muted)] uppercase mb-1.5">Veículo de Transporte</label>
+                        <select value={veiculoSelecionado} disabled className="w-full border border-[var(--border-color)] rounded-lg p-3 text-sm bg-[var(--bg-main)] text-[var(--text-muted)] cursor-not-allowed">
+                          <option>{dashboardData.veiculos?.find(v => v.id === Number(veiculoSelecionado))?.modelo || '--'}</option>
+                        </select>
+                     </div>
+                  </div>
+                )}
+              </>
+            )}
+
+            <div className="flex-1 overflow-y-auto p-4">
+              
+              {!skuEmBipagem && [...skus].sort((a, b) => {
+                const getPriority = (sku: any) => {
+                  if (sku.quantidadeBipada > 0 && sku.quantidadeBipada < sku.quantidadeTotal) return 1; 
+                  if (sku.quantidadeBipada === 0) return 2; 
+                  return 3; 
+                };
+                return getPriority(a) - getPriority(b);
+              }).map(item => {
+                const codigosMLUnicos = item.variacoes ? Array.from(new Set(item.variacoes.map(v => v.codigoML))).filter(ml => ml !== 'N/A') : [];
+                
+                const qtdBipadaReal = item.quantidadeBipada;
+                const statusReal = item.status;
+
+                let leiturasArray: any[] = [];
+                try { leiturasArray = typeof item.leituras === 'string' ? JSON.parse(item.leituras as string) : (item.leituras || []); } catch(e){}
+
+                const userNoSku = lockedSkus[lockKey(item.id)];
+                const taBloqueado = userNoSku && userNoSku !== getUsuarioLogado();
+
+                return (
+                  <div key={item.id} className={`bg-[var(--bg-panel)] border border-[var(--border-color)] rounded-xl p-4 shadow-sm mb-4 relative overflow-hidden transition-all ${item.bloqueado ? 'opacity-60' : ''}`}>
+                    {statusReal === 'CONCLUIDO' && <div className="absolute left-0 top-0 bottom-0 w-1 bg-blue-600"></div>}
+                    {item.bloqueado && <div className="absolute left-0 top-0 bottom-0 w-1 bg-rose-500"></div>}
+                    <div className="flex justify-between items-start mb-2 pl-2">
+                      <div className="flex items-center gap-3 flex-wrap">
+                        <div className="font-black text-[var(--text-main)] text-base">SKU {item.sku}</div>
+                        {codigosMLUnicos.length > 0 && (
+                          <div className="text-[10px] font-bold text-blue-600 bg-blue-500/10 border border-blue-500/30 px-2 py-0.5 rounded shadow-sm">
+                            Cód. ML: {codigosMLUnicos.join(', ')}
+                          </div>
+                        )}
+                        {item.bloqueado && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-bold text-rose-500 bg-rose-500/10 border border-rose-500/30 px-2 py-0.5 rounded-full">
+                            🚫 Fora desta carga
+                          </span>
+                        )}
+                        {taBloqueado && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-bold text-amber-600 bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded-full">
+                            <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" /> {userNoSku} bipando
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex flex-col items-end">
+                        <div className={`text-sm font-black px-2 py-1 rounded ${statusReal === 'CONCLUIDO' ? 'bg-blue-500/10 text-blue-600' : 'bg-[var(--bg-main)] text-[var(--text-main)]'}`}>
+                          {qtdBipadaReal} / {item.quantidadeTotal}
+                        </div>
+                        {statusReal !== 'CONCLUIDO' && !item.bloqueado && (
+                          <div className="text-[11px] font-bold text-rose-500 uppercase mt-1 tracking-wider">
+                            Falta bipar: {item.quantidadeTotal - qtdBipadaReal}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    
+                    <div className="text-sm font-semibold text-[var(--text-main)] leading-snug mt-3 mb-4 p-3 bg-[var(--bg-panel)] border border-[var(--border-color)] rounded-lg shadow-sm border-l-4 border-l-blue-500">
+                      {item.descricao}
+                    </div>
+
+                    {leiturasArray.length > 0 && (
+                      <div className="mt-3 mb-4 pl-2">
+                        <p className="text-[9px] font-bold text-[var(--text-muted)] uppercase tracking-widest mb-1.5">Seriais lidos:</p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {leiturasArray.map((l: any) => (
+                            <span key={l.id} className="bg-[var(--bg-main)] text-[var(--text-muted)] text-[10px] font-bold px-2 py-1 rounded border border-[var(--border-color)]">
+                              {l.codigo}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="flex gap-2 mt-3">
+                      {taBloqueado ? (
+                        <div className="flex-1 py-2.5 bg-amber-500/10 border border-amber-500/30 rounded-lg text-sm font-bold text-amber-600 flex items-center justify-center gap-1.5">
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+                          Em uso por: {userNoSku}
+                        </div>
+                      ) : item.bloqueado ? (
+                        <div className="flex-1 py-2.5 bg-[var(--bg-main)] border border-[var(--border-color)] rounded-lg text-sm font-bold text-[var(--text-muted)] flex items-center justify-center gap-1.5">
+                          Não faz parte desta carga
+                        </div>
+                      ) : (
+                        <button onClick={() => handleAbrirProduto(item)} className="flex-1 py-2.5 bg-[var(--bg-main)] hover:bg-[var(--border-color)] border border-[var(--border-color)] rounded-lg text-sm font-bold text-[var(--text-main)] transition flex items-center justify-center gap-1.5">
+                          <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Abrir Produto
+                        </button>
+                      )}
+
+                      {!taBloqueado && inboundData?.status !== 'ENVIADO' && (
+                        <button
+                          onClick={() => handleToggleBloqueio(item)}
+                          title={item.bloqueado ? 'Voltar a incluir nesta carga' : 'Marcar como fora desta carga (foi em outra)'}
+                          className={`px-3.5 py-2.5 rounded-lg border text-sm font-bold transition shrink-0 ${item.bloqueado ? 'border-emerald-500/40 text-emerald-600 hover:bg-emerald-500/10' : 'border-rose-500/30 text-rose-500 hover:bg-rose-500/10'}`}
+                        >
+                          {item.bloqueado ? '↩ Voltar' : '🚫 Bloquear'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+
+              {}
+              {skuEmBipagem && (
+                <div className={`bg-[var(--bg-panel)] border border-[var(--border-color)] rounded-xl shadow-sm overflow-hidden mb-6 relative transition-all duration-300 ${showSucessoProduto ? 'ring-4 ring-blue-500 bg-blue-500/10' : ''}`}>
+                  
+                  {showSucessoProduto && (
+                    <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[var(--bg-panel)]/90 backdrop-blur-sm animate-in fade-in">
+                      <div className="w-16 h-16 bg-blue-600 text-white rounded-full flex items-center justify-center mb-2 shadow-lg animate-bounce">
+                        <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"/></svg>
+                      </div>
+                      <span className="font-black text-blue-600 text-lg">Produto Concluído!</span>
+                    </div>
+                  )}
+
+                  <div className="p-4 border-b border-[var(--border-color)] flex flex-col gap-4 bg-[var(--bg-panel)]">
+                    <div className="flex-1">
+                      <div className="flex justify-between items-start">
+                        <div>
+                          <div className="font-black text-[var(--text-main)] text-[18px]">SKU: {skuEmBipagem.sku}</div>
+                          {skuEmBipagem.variacoes && skuEmBipagem.variacoes.length > 0 && (
+                            <div className="text-[11px] font-bold text-blue-600 mt-1 inline-block border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 rounded">
+                               Cód. ML: {Array.from(new Set(skuEmBipagem.variacoes.map(v => v.codigoML))).filter(ml => ml !== 'N/A').join(', ')}
+                            </div>
+                          )}
+                        </div>
+                        
+                        {inboundData?.status === 'ENVIADO' && skuEmBipagem.leituras && skuEmBipagem.leituras.length > 0 && (
+                           <div className="text-right">
+                             <div className="text-[9px] font-bold text-[var(--text-muted)] uppercase">Concluído às</div>
+                             <div className="text-xs font-black text-blue-600">
+                               {(() => {
+                                  try {
+                                    let leits = typeof skuEmBipagem.leituras === 'string' ? JSON.parse(skuEmBipagem.leituras) : skuEmBipagem.leituras;
+                                    if(leits.length > 0) {
+                                      const ultima = leits[0]; 
+                                      return new Date(ultima.data).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+                                    }
+                                  }catch(e){}
+                                  return '--:--';
+                               })()}
+                             </div>
+                           </div>
+                        )}
+                      </div>
+                      
+                      <div className="text-sm font-semibold text-[var(--text-main)] leading-snug mt-3 p-3 bg-[var(--bg-panel)] border border-[var(--border-color)] rounded-lg shadow-sm border-l-4 border-l-blue-500">
+                        {skuEmBipagem.descricao}
+                      </div>
+                    </div>
+                    
+                    {inboundData?.status !== 'ENVIADO' ? (
+                      <div className="flex gap-3">
+                        <div className="flex-1 text-center bg-rose-500/10 border border-rose-500/30 p-3 rounded-xl shadow-sm flex flex-col justify-center">
+                          <div className="text-[10px] font-black text-rose-500 uppercase tracking-widest">Faltam</div>
+                          <div className={`text-3xl font-black leading-none mt-1 ${skuEmBipagem.quantidadeTotal - skuEmBipagem.quantidadeBipada === 0 ? 'text-[var(--text-muted)]' : 'text-rose-600'}`}>
+                            {skuEmBipagem.quantidadeTotal - skuEmBipagem.quantidadeBipada}
+                          </div>
+                        </div>
+                        <div className="flex-1 text-center bg-blue-500/10 border border-blue-500/30 p-3 rounded-xl shadow-sm flex flex-col justify-center">
+                          <div className="text-[10px] font-black text-blue-600 uppercase tracking-widest">Bipados</div>
+                          <div className={`text-3xl font-black leading-none mt-1 ${skuEmBipagem.quantidadeBipada >= skuEmBipagem.quantidadeTotal ? 'text-blue-600' : 'text-[var(--text-main)]'}`}>
+                            {skuEmBipagem.quantidadeBipada}
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="w-full py-4 text-center bg-[var(--border-color)] text-[var(--text-muted)] font-black text-[15px] rounded-xl shadow-inner uppercase tracking-wider">
+                        Envio já despachado
+                      </div>
+                    )}
+                  </div>
+                  
+                  {inboundData?.status !== 'ENVIADO' && (
+                    <div className="p-5 bg-[var(--bg-main)]">
+                      {!isScanning ? (
+                        <button 
+                          onClick={handleIniciarBipagem} 
+                          className="w-full py-4 bg-blue-600 text-white font-bold text-[15px] rounded-xl shadow-md hover:bg-blue-700 transition active:scale-[0.98]"
+                        >
+                          Iniciar Bipagem
+                        </button>
+                      ) : (
+                        <div>
+                          
+                          {!modoTravado ? (
+                            <div className="mb-4">
+                              <p className="text-center text-xs font-bold text-[var(--text-muted)] uppercase mb-2">Selecione o modo de bipagem:</p>
+                              <div className="flex gap-2 p-1.5 bg-[var(--bg-panel)] border border-[var(--border-color)] rounded-lg shadow-sm">
+                                <button 
+                                  onClick={() => handleConfirmarModo('SKU_EAN')} 
+                                  className="flex-1 py-4 text-xs font-bold rounded-lg transition bg-[var(--bg-panel)] border-2 border-[var(--border-color)] hover:border-blue-500 hover:text-blue-600 text-[var(--text-muted)] shadow-sm uppercase tracking-wider"
+                                >
+                                  SKU / EAN
+                                </button>
+                                <button 
+                                  onClick={() => handleConfirmarModo('SERIE')} 
+                                  className="flex-1 py-4 text-xs font-bold rounded-lg transition bg-[var(--bg-panel)] border-2 border-[var(--border-color)] hover:border-blue-500 hover:text-blue-600 text-[var(--text-muted)] shadow-sm uppercase tracking-wider"
+                                >
+                                  Número de Série
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="animate-in fade-in zoom-in-95 duration-200">
+                              <div className="flex items-center justify-between mb-4">
+                                <div className="flex items-center gap-2">
+                                  <span className="relative flex h-2.5 w-2.5"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-500 opacity-75"></span><span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-blue-600"></span></span>
+                                  <span className="text-xs font-bold text-blue-600">Leitor Ativo ({modoBipagem === 'SERIE' ? 'Série' : 'SKU/EAN'})</span>
+                                </div>
+                                
+                                <div className="flex items-center gap-2">
+                                  <button 
+                                    type="button" 
+                                    onClick={() => {
+                                      setTecladoLiberado(!tecladoLiberado);
+                                      if (!tecladoLiberado) setTimeout(() => inputBipagemRef.current?.focus(), 100);
+                                    }} 
+                                    className={`flex items-center gap-1.5 text-[10px] font-bold uppercase px-2.5 py-1.5 rounded-md transition-colors border ${tecladoLiberado ? 'bg-blue-50 text-blue-700 border-blue-200 shadow-inner' : 'bg-[var(--bg-main)] text-[var(--text-muted)] border-transparent hover:bg-[var(--border-color)]'}`}
+                                  >
+                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      {tecladoLiberado ? <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /> : <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" />}
+                                    </svg>
+                                    Teclado
+                                  </button>
+
+                                  <button onClick={() => setModoConfirmModal({ isOpen: true, novoModo: modoBipagem === 'SERIE' ? 'SKU_EAN' : 'SERIE' })} className="text-[10px] font-bold text-[var(--text-muted)] hover:text-[var(--text-main)] uppercase bg-[var(--border-color)] px-3 py-1.5 rounded-md transition-colors">Trocar Modo</button>
+                                </div>
+                              </div>
+
+                              {modoBipagem === 'SERIE' && mascaraSerie && (
+                                <div className="mb-3 px-3 py-2 bg-blue-50 border border-blue-100 rounded-lg flex items-center justify-between">
+                                  <span className="text-[11px] font-bold text-blue-700 flex items-center gap-1">
+                                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
+                                    Padrão: {mascaraSerie}
+                                  </span>
+                                  
+                                  {skuEmBipagem.quantidadeBipada === 0 ? (
+                                    <button type="button" onClick={resetarMascara} className="text-[10px] uppercase font-bold text-blue-500 hover:text-blue-800 underline">Redefinir</button>
+                                  ) : (
+                                    <span className="text-[9px] uppercase font-bold text-blue-400">Em uso</span>
+                                  )}
+                                </div>
+                              )}
+
+                              <form onSubmit={handleBipar}>
+                                <input 
+                                  ref={inputBipagemRef} 
+                                  type="text" 
+                                  inputMode={tecladoLiberado ? "text" : "none"}
+                                  autoComplete="off"
+                                  value={codigoLido} 
+                                  onChange={(e) => setCodigoLido(e.target.value)} 
+                                  placeholder={
+                                    modoBipagem === 'SERIE' 
+                                      ? (!mascaraSerie ? "Bipe o 1º Serial para definir o padrão..." : "Bipe o próximo Serial...") 
+                                      : "Bipar código..."
+                                  } 
+                                  className="w-full border-2 border-blue-500 rounded-xl p-4 text-center font-bold text-[var(--text-main)] focus:outline-none focus:ring-4 focus:ring-blue-500/20 transition shadow-inner bg-[var(--bg-panel)] placeholder:text-[var(--text-muted)] placeholder:font-medium" 
+                                />
+                                <button type="submit" className="hidden"></button>
+                              </form>
+                            </div>
+                          )}
+
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {skuEmBipagem.leituras && skuEmBipagem.leituras.length > 0 && (
+                    <div className="p-4 bg-[var(--bg-main)] border-t border-[var(--border-color)]">
+                       <h4 className="text-[10px] font-bold text-[var(--text-muted)] uppercase tracking-wider mb-2">Histórico de Bipagem</h4>
+                      <ul className="space-y-1.5 max-h-32 overflow-y-auto pr-2">
+                        {(() => {
+                           let leiturasArray = [];
+                           try { leiturasArray = typeof skuEmBipagem.leituras === 'string' ? JSON.parse(skuEmBipagem.leituras) : (skuEmBipagem.leituras || []); } catch(e){}
+                           
+                           return [...leiturasArray].reverse().map((l: any) => (
+                             <li key={l.id} className="flex justify-between items-center bg-[var(--bg-panel)] p-2 rounded-lg shadow-sm border border-[var(--border-color)]">
+                               <div className="flex flex-col">
+                                 <div className="flex items-center gap-2">
+                                   <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${l.tipo === 'SERIE' ? 'bg-blue-100 text-blue-700' : 'bg-blue-500/10 text-blue-600'}`}>{l.tipo === 'SERIE' ? 'SÉRIE' : 'SKU/EAN'}</span>
+                                   <span className="text-sm font-bold text-[var(--text-main)]">{l.codigo}</span>
+                                 </div>
+                                 <span className="text-[9px] text-[var(--text-muted)] mt-1 font-medium ml-1 flex items-center gap-1">
+                                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
+                                    Bipado por: {l.usuarioNome || 'Operador'}
+                                 </span>
+                               </div>
+                               
+                               {inboundData?.status !== 'ENVIADO' && (
+                                 <button type="button" onClick={() => handleRemoverLeitura(l.id)} className="text-[var(--text-muted)] hover:text-rose-500 p-2 transition">
+                                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                                 </button>
+                               )}
+                             </li>
+                           ));
+                        })()}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
+
+            </div>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
